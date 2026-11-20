@@ -29,6 +29,159 @@ pnpm contract:build # stellar contract build -> wasm32v1-none
 > The contract needs `stellar-cli` v25.2.0+ (`soroban-sdk` 29 requires it for
 > the wasm build) and the `wasm32v1-none` Rust target. CI installs both.
 
+> Stuck on a CLI code, contract trap (`Error(Contract, #n)`) or a proxy 401/403?
+> Start with the [troubleshooting guide](./docs/troubleshooting.md). User-facing
+> and contract changes need an entry in [CHANGELOG.md](./CHANGELOG.md).
+
+## Your first contribution: good first issues
+
+This is the full path from a fresh clone to a reviewable pull request. Output
+blocks carry one of two labels:
+
+- **REAL** — a literal string produced by the current source or CI configuration.
+- **UNVERIFIED** — an example value (fork name, branch, counts, timings, URL). Check
+  it against your own run; do not paste example output into a PR as evidence.
+
+### 1. Claim a real open issue
+
+Comment on the issue to ask for assignment and wait for a maintainer to confirm.
+Three open `good first issue` examples at the time this guide was written (check
+the [current issue list](https://github.com/KeyLease-Security/keylease-gateway/issues/labels/good%20first%20issue)
+before choosing one):
+
+- [#125 — proxy HTTP reference](https://github.com/KeyLease-Security/keylease-gateway/issues/125)
+- [#126 — integration snippets for curl, Node and Go](https://github.com/KeyLease-Security/keylease-gateway/issues/126)
+- [#127 — session token format with a worked example](https://github.com/KeyLease-Security/keylease-gateway/issues/127)
+
+### 2. Clone your fork and branch from upstream
+
+Replace `<your-username>` with your GitHub handle. The example below uses the
+`docs` issue #125; use the slug of the issue you claimed.
+
+```bash
+git clone https://github.com/<your-username>/keylease-gateway.git
+cd keylease-gateway
+git remote add upstream https://github.com/KeyLease-Security/keylease-gateway.git
+git fetch upstream
+git checkout -b docs/125-proxy-http-reference upstream/main
+```
+
+```text
+UNVERIFIED — Cloning into 'keylease-gateway'...
+UNVERIFIED — branch 'docs/125-proxy-http-reference' set up to track 'upstream/main'.
+```
+
+Keep `origin` pointing at **your fork** and `upstream` at
+`KeyLease-Security/keylease-gateway`. Push only to `origin`.
+
+### 3. Install and smoke-test the toolchain
+
+Node `>=20.11.0` and pnpm `12.3.4` come from `package.json`; Rust and the
+`wasm32v1-none` target are needed only for contract work.
+
+```bash
+corepack enable
+pnpm install --frozen-lockfile
+pnpm build
+node packages/cli/dist/index.js --version
+```
+
+```text
+REAL — keylease 0.1.0
+```
+
+```bash
+git status --short --branch
+```
+
+```text
+UNVERIFIED — ## docs/125-proxy-http-reference...origin/docs/125-proxy-http-reference
+```
+
+A clean status before you edit is the baseline. If `pnpm install` fails, fix the
+toolchain before claiming the issue is blocked.
+
+### 4. Run the focused test, then the full gates
+
+Start with the smallest suite that covers the file you touched, then run the
+same checks CI runs (see [CI workflow](./.github/workflows/ci.yml)).
+
+```bash
+# Pick the line that matches your area.
+pnpm --filter @keylease/cli test -- src/index.test.ts
+pnpm --filter @keylease/proxy test -- src/verifier.test.ts
+cargo test --manifest-path contracts/keylease-core/Cargo.toml <test_name>
+
+# Then the full gates.
+pnpm lint
+pnpm typecheck
+pnpm test
+pnpm contract:test
+pnpm contract:build
+```
+
+```text
+UNVERIFIED — vitest/cargo summary lines: file counts, test counts and elapsed time depend on your change and machine.
+```
+
+The exact conventions for what to assert and which fake to inject are in
+[Testing conventions](#testing-conventions) below. A change without a
+new/updated assertion is not ready for review.
+
+### 5. Commit, push and open the PR
+
+Use a Conventional Commits header. The PR title is what lands on `main` on
+squash merge, and CI validates it.
+
+```bash
+git add <files-you-changed>
+git commit -m "docs: add proxy HTTP reference (#125)"
+git push -u origin docs/125-proxy-http-reference
+```
+
+Preview and validate the title locally:
+
+```bash
+node scripts/pr-title-suggestion.mjs "docs: add proxy HTTP reference"
+printf '%s\n' "docs: add proxy HTTP reference" | pnpm commitlint
+```
+
+Open a PR from your fork's branch to `KeyLease-Security/keylease-gateway:main`,
+fill in [the PR template](./.github/pull_request_template.md), and replace
+`Fixes #` with `Fixes #125`. The output URL is **UNVERIFIED** until GitHub
+creates it.
+
+### Labels and points
+
+The issue templates encode the effort scheme used by this repository:
+
+| Template | Labels it sets | Effort | Points |
+| --- | --- | --- | --- |
+| `trivial_issue.md` | `size/trivial`, `points/100` | Single sitting | 100 |
+| `medium_issue.md` | `size/medium`, `points/150` | One package | 150 |
+| `high_issue.md` | `size/high`, `points/200` | Cross-cutting / security | 200 |
+
+Other labels in use: `documentation`, `enhancement`, `bug`, `security`,
+`good first issue`, `help wanted`, `Stellar Wave`, and the area labels
+`area/cli`, `area/proxy`, `area/contract`, `area/docs`, `area/ci`. Security and
+cross-cutting work belongs in a **high** issue or a private report per
+[SECURITY.md](./SECURITY.md). Points describe the template's estimate, not a
+payment.
+
+### What a reviewable PR looks like
+
+- [ ] One logical change; no unrelated formatting or generated `dist/` files.
+- [ ] PR title follows Conventional Commits; local `commitlint` check passes.
+- [ ] The PR template is filled in and `Fixes #<issue>` links the claimed issue.
+- [ ] New behaviour has a new/updated assertion; focused test and full `pnpm test`
+      were both run.
+- [ ] `pnpm lint`, `pnpm build`, `pnpm -r typecheck` and `pnpm test` pass; contract
+      changes also pass `pnpm contract:test` and `pnpm contract:build`.
+- [ ] `README.md` / `CONTRIBUTING.md` and docs are updated when behaviour or
+      config changed; changelog entries are added for shipped changes.
+- [ ] No secrets, private keys, session tokens or `.env` files are committed.
+- [ ] The diff can be reviewed in one sitting; if it cannot, say why in the PR.
+
 ## Project layout
 
 ```

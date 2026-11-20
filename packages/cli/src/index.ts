@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 import {
   acquireCommand,
   envCommand,
+  resolveConsumerSecret,
   type AcquireArgs,
   type AcquireDeps,
   type EnvArgs,
@@ -14,10 +15,13 @@ import { statusCommand, type StatusArgs, type StatusDeps } from './commands/stat
 import {
   revokeCommand,
   settleCommand,
+  useCallCommand,
   type RevokeArgs,
   type RevokeDeps,
   type SettleArgs,
   type SettleDeps,
+  type UseCallArgs,
+  type UseCallDeps,
 } from './commands/lifecycle.js';
 import {
   sessionsCommand,
@@ -36,12 +40,16 @@ import {
   type KeyleaseConfigFile,
   type ResolvedConfig,
 } from './config.js';
-import { CliError } from './errors.js';
+import { CliError, redactToken } from './errors.js';
+import { renderError } from './error-renderer.js';
 
-export { CliError } from './errors.js';
+export { CliError, redactToken } from './errors.js';
 
 export const CLI_NAME = 'keylease';
 export const CLI_VERSION = '0.1.0';
+
+/** Maximum lease duration in seconds (365 days). */
+export const MAX_DURATION_SECONDS = 365 * 24 * 60 * 60;
 
 export interface CliIo {
   out(line?: string): void;
@@ -74,6 +82,7 @@ export interface RunDeps {
   status?: StatusDeps;
   settle?: SettleDeps;
   revoke?: RevokeDeps;
+  'use-call'?: UseCallDeps;
   sessions?: SessionsDeps;
   /** Directory holding `.keyleaserc.json` (default: `process.cwd()`). */
   cwd?: string;
@@ -86,9 +95,12 @@ export interface RunDeps {
 const OPTION_SPEC = {
   service: { type: 'string' },
   calls: { type: 'string' },
+  count: { type: 'string' },
   duration: { type: 'string' },
   secret: { type: 'string' },
-  lease: { type: 'string' },
+  lease: { type: 'string', multiple: true },
+  fee: { type: 'string' },
+  timeout: { type: 'string' },
   token: { type: 'string' },
   network: { type: 'string' },
   rpc: { type: 'string' },
@@ -102,9 +114,14 @@ const OPTION_SPEC = {
 } as const;
 
 type ParsedOptions = {
-  [K in keyof typeof OPTION_SPEC]?: (typeof OPTION_SPEC)[K]['type'] extends 'string'
-    ? string
-    : boolean;
+  [K in keyof typeof OPTION_SPEC]?: (typeof OPTION_SPEC)[K] extends {
+    type: 'string';
+    multiple: true;
+  }
+    ? string[]
+    : (typeof OPTION_SPEC)[K]['type'] extends 'string'
+      ? string
+      : boolean;
 };
 
 function readOptions(args: string[]): { values: ParsedOptions; positionals: string[] } {
@@ -131,7 +148,11 @@ function requireString(values: ParsedOptions, name: keyof ParsedOptions): string
 }
 
 function optionalString(values: ParsedOptions, name: keyof ParsedOptions): string | undefined {
-  const value = values[name];
+  const raw = values[name];
+  if (Array.isArray(raw) && raw.length > 1) {
+    throw new CliError(`--${name} may only be specified once here`, 'invalid_option');
+  }
+  const value = Array.isArray(raw) ? raw[0] : raw;
   if (value === undefined) return undefined;
   if (typeof value !== 'string' || value.length === 0) {
     throw new CliError(`--${name} must be a non-empty value`, 'invalid_option');
@@ -139,8 +160,28 @@ function optionalString(values: ParsedOptions, name: keyof ParsedOptions): strin
   return value;
 }
 
+function requireLeaseIds(values: ParsedOptions): string[] {
+  const raw = values.lease;
+  if (raw === undefined) throw new CliError('--lease is required', 'missing_option');
+  const valuesToSplit = Array.isArray(raw) ? raw : [raw];
+  const leaseIds = valuesToSplit.flatMap((value) => value.split(',').map((id) => id.trim()));
+  if (leaseIds.some((id) => id.length === 0)) {
+    throw new CliError('--lease must contain non-empty lease IDs', 'invalid_option');
+  }
+  return [...new Set(leaseIds)];
+}
+
 function requirePositiveInt(values: ParsedOptions, name: keyof ParsedOptions): number {
   const raw = requireString(values, name);
+  return parsePositiveInt(raw, name);
+}
+
+function optionalPositiveInt(values: ParsedOptions, name: keyof ParsedOptions): number | undefined {
+  const raw = optionalString(values, name);
+  return raw === undefined ? undefined : parsePositiveInt(raw, name);
+}
+
+function parsePositiveInt(raw: string, name: keyof ParsedOptions): number {
   if (!/^[0-9]+$/.test(raw)) {
     throw new CliError(`--${name} must be a positive integer, got "${raw}"`, 'invalid_option');
   }
@@ -151,6 +192,15 @@ function requirePositiveInt(values: ParsedOptions, name: keyof ParsedOptions): n
   return parsed;
 }
 
+function requireDuration(values: ParsedOptions): number {
+  const duration = requirePositiveInt(values, 'duration');
+  if (duration > MAX_DURATION_SECONDS) {
+    throw new CliError(
+      `--duration must not exceed ${MAX_DURATION_SECONDS} seconds (365 days), got ${duration}`,
+      'invalid_option',
+    );
+  }
+  return duration;
 function validateRpcUrl(url: string): void {
   // Validate RPC URL at parse time to catch typos early
   let parsed: URL;
@@ -194,6 +244,20 @@ function networkArgs(values: ParsedOptions): {
     network: optionalString(values, 'network'),
     rpc,
     contract: optionalString(values, 'contract'),
+  };
+}
+
+function transactionArgs(values: ParsedOptions): {
+  network?: string | undefined;
+  rpc?: string | undefined;
+  contract?: string | undefined;
+  fee?: number | undefined;
+  timeout?: number | undefined;
+} {
+  return {
+    ...networkArgs(values),
+    fee: optionalPositiveInt(values, 'fee'),
+    timeout: optionalPositiveInt(values, 'timeout'),
   };
 }
 
@@ -249,10 +313,12 @@ export function parseArgv(argv: string[], options: ParseOptions = {}): Invocatio
         throw new CliError('--secret is required unless --dry-run is set', 'missing_option');
       }
       const args: AcquireArgs = {
+        ...transactionArgs(values),
+        service: requireString(values, 'service'),
         ...networkArgs(values),
         service: serviceFrom(values, options),
         calls: requirePositiveInt(values, 'calls'),
-        duration: requirePositiveInt(values, 'duration'),
+        duration: requireDuration(values),
         secret,
         dryRun,
         json: values.json === true,
@@ -290,8 +356,8 @@ export function parseArgv(argv: string[], options: ParseOptions = {}): Invocatio
       return {
         command: 'settle',
         args: {
-          ...networkArgs(values),
-          lease: requireString(values, 'lease'),
+          ...transactionArgs(values),
+          lease: requireLeaseIds(values),
           secret: requireString(values, 'secret'),
           json: values.json === true,
         },
@@ -302,8 +368,21 @@ export function parseArgv(argv: string[], options: ParseOptions = {}): Invocatio
       return {
         command: 'revoke',
         args: {
+          ...transactionArgs(values),
+          lease: requireLeaseIds(values),
+          secret: requireString(values, 'secret'),
+          json: values.json === true,
+        },
+      };
+    }
+    case 'use-call': {
+      ensureNoPositionals(positionals);
+      return {
+        command: 'use-call',
+        args: {
           ...networkArgs(values),
           lease: requireString(values, 'lease'),
+          count: requirePositiveInt(values, 'count'),
           secret: requireString(values, 'secret'),
           json: values.json === true,
         },
@@ -346,11 +425,11 @@ export function renderHelp(): string {
   return `${CLI_NAME} ${CLI_VERSION} - Soroban lease manager for KeyLease gateways
 
 Usage:
-  ${CLI_NAME} acquire --service <id> --calls <count> --duration <secs> --secret <key>
+  ${CLI_NAME} acquire --service <id> --calls <count> --duration <secs> --secret <key> [--fee <stroops>] [--timeout <seconds>]
   ${CLI_NAME} env     --service <id> [--file <path>]
   ${CLI_NAME} status  --lease <id> | --token <session-token> [--check-chain]
-  ${CLI_NAME} settle  --lease <id> --secret <key>
-  ${CLI_NAME} revoke  --lease <id> --secret <key>
+  ${CLI_NAME} settle  --lease <id>[,<id>...] [--lease <id> ...] --secret <key> [--fee <stroops>] [--timeout <seconds>]
+  ${CLI_NAME} revoke  --lease <id>[,<id>...] [--lease <id> ...] --secret <key> [--fee <stroops>] [--timeout <seconds>]
   ${CLI_NAME} sessions [--prune] [--json]
   ${CLI_NAME} completions <shell>
   ${CLI_NAME} help | --version
@@ -367,8 +446,11 @@ Commands:
 Options:
   --service <id>       Service identifier the lease is scoped to (default: .keyleaserc.json)
   --calls <count>      Number of API calls the lease authorises
-  --duration <secs>    Lease lifetime in seconds
+  --duration <secs>    Lease lifetime in seconds (max: ${MAX_DURATION_SECONDS} / 365 days)
   --secret <key>       Stellar secret seed (S...) of the consumer account
+  --lease <id>         On-chain lease id (repeatable or comma-separated for settle/revoke)
+  --fee <stroops>      Transaction inclusion fee in stroops (positive integer)
+  --timeout <seconds>  Transaction envelope timeout (positive integer; default: 60)
   --dry-run            Quote the price of --calls without signing or submitting
   --lease <id>         On-chain lease id (decimal u64)
   --token <token>      Session bearer token to verify offline
@@ -438,12 +520,22 @@ function withResolvedNetwork(invocation: Invocation, resolved: ResolvedConfig): 
   } as Invocation;
 }
 
+/**
+ * Detects whether --json flag is present in argv.
+ * Used early to determine error rendering mode.
+ */
+function hasJsonFlag(argv: string[]): boolean {
+  return argv.includes('--json');
+}
+
 /** Parses and dispatches a CLI invocation, returning a process exit code. */
 export async function run(
   argv: string[],
   io: CliIo = consoleIo,
   deps: RunDeps = {},
 ): Promise<number> {
+  const json = hasJsonFlag(argv);
+
   let invocation: Invocation;
   try {
     if (isMetaInvocation(argv)) {
@@ -460,8 +552,7 @@ export async function run(
     }
   } catch (error) {
     if (error instanceof CliError) {
-      io.err(`error: ${error.message}`);
-      io.err(`run "${CLI_NAME} help" for usage`);
+      renderError(error, io, json);
       return error.exitCode;
     }
     throw error;
@@ -485,6 +576,8 @@ export async function run(
         return await settleCommand(invocation.args, io, deps.settle);
       case 'revoke':
         return await revokeCommand(invocation.args, io, deps.revoke);
+      case 'use-call':
+        return await useCallCommand(invocation.args, io, deps['use-call']);
       case 'sessions':
         return await sessionsCommand(invocation.args, io, deps.sessions);
       case 'completions':
@@ -492,11 +585,10 @@ export async function run(
     }
   } catch (error) {
     if (error instanceof CliError) {
-      io.err(`error: ${error.message}`);
+      renderError(error, io, json);
       return error.exitCode;
     }
-    const message = error instanceof Error ? error.message : String(error);
-    io.err(`error: ${message}`);
+    renderError(error, io, json);
     return 1;
   }
 }

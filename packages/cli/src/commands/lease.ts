@@ -1,5 +1,6 @@
 import { mkdir, open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
+import { createInterface } from 'node:readline';
 import { Keypair } from '@stellar/stellar-sdk';
 import { mintSessionToken } from '../token.js';
 import { SorobanClient, type CreateLeaseResult } from '../client/soroban.js';
@@ -33,7 +34,12 @@ export interface NetworkArgs {
   contract?: string | undefined;
 }
 
-export interface AcquireArgs extends NetworkArgs {
+export interface TransactionArgs extends NetworkArgs {
+  fee?: number | undefined;
+  timeout?: number | undefined;
+}
+
+export interface AcquireArgs extends TransactionArgs {
   service: string;
   calls: number;
   duration: number;
@@ -57,6 +63,10 @@ export interface LeaseSession {
   consumer: string;
   token: string;
   callsLimit: number;
+  /** Total escrowed amount in token smallest units. Optional for legacy sessions. */
+  pricePaid?: number;
+  /** Amount per call in token smallest units. Optional for legacy sessions. */
+  pricePerCall?: number;
   issuedAt: number;
   expiresAt: number;
   txHash: string | null;
@@ -164,9 +174,11 @@ async function writeAtomic(path: string, contents: string): Promise<void> {
 }
 
 export interface AcquireDeps {
+  createClient?: (args: AcquireArgs) => Pick<SorobanClient, 'createLease' | 'quote' | 'getLeaseState'>;
   createClient?: (args: AcquireArgs) => Pick<SorobanClient, 'createLease' | 'quote'>;
   store?: SessionStore;
   now?: () => number;
+  readSecretFromStdin?: () => Promise<string>;
 }
 
 export interface EnvDeps {
@@ -186,6 +198,10 @@ function isLeaseSession(value: unknown): value is LeaseSession {
     typeof session['token'] === 'string' &&
     typeof session['callsLimit'] === 'number' &&
     Number.isFinite(session['callsLimit']) &&
+    (session['pricePaid'] === undefined ||
+      (typeof session['pricePaid'] === 'number' && Number.isFinite(session['pricePaid']))) &&
+    (session['pricePerCall'] === undefined ||
+      (typeof session['pricePerCall'] === 'number' && Number.isFinite(session['pricePerCall']))) &&
     typeof session['issuedAt'] === 'number' &&
     Number.isFinite(session['issuedAt']) &&
     typeof session['expiresAt'] === 'number' &&
@@ -280,14 +296,11 @@ export function selectLease(
  *
  * File permissions:
  *   Created with mode 0o600 (owner read/write only) to protect sensitive tokens.
- */
-export function fileSessionStore(cwd: string = process.cwd()): SessionStore {
-/**
- * File-backed store, one JSON document keyed by service id.
  *
- * This is a local cache, not a database. Writes are serialized per path within
- * the process, guarded across processes by a best-effort `<path>.lock` file,
- * and land via an atomic temp-file rename so readers never see a torn file.
+ * Concurrency:
+ *   This is a local cache, not a database. Writes are serialized per path within
+ *   the process, guarded across processes by a best-effort `<path>.lock` file,
+ *   and land via an atomic temp-file rename so readers never see a torn file.
  */
 export function fileSessionStore(
   cwd: string = process.cwd(),
@@ -322,7 +335,7 @@ export function fileSessionStore(
     return run;
   }
 
-  const writeSessions = (sessions: Record<string, LeaseSession>): Promise<void> =>
+  const writeSessions = (sessions: Record<string, LeaseSession[]>): Promise<void> =>
     writeAtomic(path, `${JSON.stringify(sessions, null, 2)}\n`);
 
   return {
@@ -349,46 +362,96 @@ export function fileSessionStore(
       return sessions;
     },
     async save(session: LeaseSession): Promise<void> {
-      let sessions: Record<string, LeaseSession[]>;
-      try {
-        sessions = await this.load();
-      } catch (error) {
-        if (!(error instanceof SessionStoreError) || error.code !== 'missing') throw error;
-        sessions = {};
-      }
-
-      // Add or update lease in array (idempotent: replace if same leaseId exists)
-      if (!sessions[session.service]) {
-        sessions[session.service] = [];
-      }
-      const idx = sessions[session.service].findIndex((s) => s.leaseId === session.leaseId);
-      if (idx >= 0) {
-        sessions[session.service][idx] = session;
-      } else {
-        sessions[session.service].push(session);
-      }
-
-      await this.saveAll(sessions);
-    },
-    async saveAll(sessions: Record<string, LeaseSession[]>): Promise<void> {
-      await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, `${JSON.stringify(sessions, null, 2)}\n`, { mode: 0o600 });
       await exclusive(async () => {
-        let sessions: Record<string, LeaseSession>;
+        let sessions: Record<string, LeaseSession[]>;
         try {
           sessions = await this.load();
         } catch (error) {
           if (!(error instanceof SessionStoreError) || error.code !== 'missing') throw error;
           sessions = {};
         }
-        sessions[session.service] = session;
+
+        // Add or update lease in array (idempotent: replace if same leaseId exists)
+        const list = sessions[session.service] ?? [];
+        const idx = list.findIndex((s) => s.leaseId === session.leaseId);
+        if (idx >= 0) {
+          list[idx] = session;
+        } else {
+          list.push(session);
+        }
+        sessions[session.service] = list;
         await writeSessions(sessions);
       });
     },
-    async saveAll(sessions: Record<string, LeaseSession>): Promise<void> {
+    async saveAll(sessions: Record<string, LeaseSession[]>): Promise<void> {
       await exclusive(() => writeSessions(sessions));
     },
   };
+}
+
+/**
+ * Resolves the consumer secret with precedence: flag value > KEYLEASE_SECRET env var > stdin.
+ * If secret is '-', reads one line from stdin without echoing (like `read -s`).
+ * If secret is undefined, checks KEYLEASE_SECRET environment variable.
+ * If neither is provided, reads from stdin.
+ * 
+ * @param secretArg - The --secret flag value (may be '-' for stdin or undefined for env/stdin fallback)
+ * @param deps - Optional dependencies for reading from stdin (used for testing)
+ */
+export async function resolveConsumerSecret(
+  secretArg: string | undefined,
+  deps?: { readSecretFromStdin?: () => Promise<string> },
+): Promise<string> {
+  // Precedence 1: --secret flag value (except '-' which means stdin)
+  if (secretArg && secretArg !== '-') {
+    return secretArg;
+  }
+
+  // Precedence 2: KEYLEASE_SECRET environment variable
+  const envSecret = process.env['KEYLEASE_SECRET'];
+  if (envSecret && secretArg !== '-') {
+    return envSecret;
+  }
+
+  // Precedence 3 or fallback: Read from stdin without echoing
+  const reader = deps?.readSecretFromStdin ?? readSecretFromStdin;
+  return reader();
+}
+
+/**
+ * Reads one line from stdin without echoing, similar to `read -s` in bash.
+ */
+export async function readSecretFromStdin(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const rl = createInterface({
+      input: process.stdin,
+      output: process.stderr, // Write prompts to stderr to keep stdout clean
+    });
+
+    // Disable echo on the input stream
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true);
+    }
+
+    rl.question('', (secret) => {
+      // Restore normal mode and output a newline
+      if (process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+      }
+      process.stderr.write('\n');
+      rl.close();
+      resolve(secret);
+    });
+
+    // Handle errors
+    rl.on('error', (error) => {
+      if (process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+      }
+      rl.close();
+      reject(error);
+    });
+  });
 }
 
 export function parseConsumerSecret(secret: string): Keypair {
@@ -399,12 +462,15 @@ export function parseConsumerSecret(secret: string): Keypair {
   }
 }
 
+function defaultCreateClient(
+  args: AcquireArgs,
+): Pick<SorobanClient, 'createLease' | 'quote' | 'getLeaseState'> {
 function defaultCreateClient(args: AcquireArgs): Pick<SorobanClient, 'createLease' | 'quote'> {
   return SorobanClient.fromEnv({
     KEYLEASE_NETWORK: args.network,
     KEYLEASE_RPC_URL: args.rpc,
     KEYLEASE_CONTRACT_ID: args.contract,
-  });
+  }, undefined, { fee: args.fee, timeout: args.timeout });
 }
 
 function renderAcquireOutput(session: LeaseSession, io: CliIo, json: boolean): void {
@@ -416,6 +482,8 @@ function renderAcquireOutput(session: LeaseSession, io: CliIo, json: boolean): v
           lease_id: session.leaseId,
           consumer: session.consumer,
           calls: session.callsLimit,
+          price_paid: session.pricePaid,
+          price_per_call: session.pricePerCall,
           issued_at: session.issuedAt,
           expires_at: session.expiresAt,
           tx_hash: session.txHash,
@@ -431,6 +499,8 @@ function renderAcquireOutput(session: LeaseSession, io: CliIo, json: boolean): v
   io.out(`Lease ${session.leaseId} acquired for service "${session.service}"`);
   io.out(`  consumer   : ${session.consumer}`);
   io.out(`  calls      : ${session.callsLimit} (prepaid into contract escrow)`);
+  if (session.pricePaid !== undefined) io.out(`  price paid : ${session.pricePaid}`);
+  if (session.pricePerCall !== undefined) io.out(`  price/call : ${session.pricePerCall}`);
   io.out(`  expires at : ${new Date(session.expiresAt * 1000).toISOString()}`);
   if (session.txHash) io.out(`  tx hash    : ${session.txHash}`);
   io.out('');
@@ -476,7 +546,7 @@ function renderDryRunOutput(summary: DryRunSummary, io: CliIo, json: boolean): v
 }
 
 /**
- * `keylease acquire --service <id> --calls <count> --duration <secs> --secret <key>`
+ * `keylease acquire --service <id> --calls <count> --duration <secs> [--secret <key>]`
  *
  * Invokes `create_lease` on the keylease-core contract, then mints an ed25519-signed
  * session bearer token bound to `(lease_id, consumer)`. Appends the lease to the
@@ -487,7 +557,8 @@ function renderDryRunOutput(summary: DryRunSummary, io: CliIo, json: boolean): v
  *   - Same leaseId: replaced in-place (e.g., on retry or renewal with tx hash update)
  *   - env command: automatically selects newest unexpired lease
  * Invokes `create_lease` on `keylease-core`, then mints an ed25519-signed
- * session bearer token bound to `(lease_id, consumer)`.
+ * session bearer token bound to `(lease_id, consumer)` that also carries the
+ * `--service` id as its `service` claim.
  *
  * With `--dry-run` the price is read through `quote` instead: nothing is signed,
  * no lease is created, and no session is written to the local store.
@@ -500,6 +571,14 @@ export async function acquireCommand(
   const createClient = deps.createClient ?? defaultCreateClient;
   const store = deps.store ?? fileSessionStore();
   const now = deps.now ?? (() => Date.now());
+  const client = createClient(args);
+  const quotedPricePaid = await client.quote(args.service, args.calls);
+  if (
+    !Number.isSafeInteger(quotedPricePaid) ||
+    quotedPricePaid <= 0 ||
+    quotedPricePaid % args.calls !== 0
+  ) {
+    throw new Error(`contract returned an invalid lease quote: ${quotedPricePaid}`);
   const consumer = args.secret === undefined ? undefined : parseConsumerSecret(args.secret);
 
   if (args.dryRun) {
@@ -525,20 +604,29 @@ export async function acquireCommand(
     throw new CliError('--secret is required unless --dry-run is set', 'missing_option');
   }
 
-  const result: CreateLeaseResult = await createClient(args).createLease({
+  const result: CreateLeaseResult = await client.createLease({
     service: args.service,
     calls: args.calls,
     duration: args.duration,
     consumer,
   });
+  const chainState = await client.getLeaseState(result.leaseId);
+  if (chainState.pricePaid !== quotedPricePaid) {
+    io.err(
+      `warning: quoted ${quotedPricePaid}, but the lease escrowed ${chainState.pricePaid}; recording the on-chain amount`,
+    );
+  }
 
   const issuedAt = Math.floor(now() / 1000);
   const expiresAt = issuedAt + args.duration;
+  // `args.service` is exactly the id `createLease` was invoked with, so the
+  // claim names the service the on-chain lease was bought for.
   const token = mintSessionToken({
     leaseId: result.leaseId,
-    consumerSecret: args.secret,
+    consumerSecret: secret,
     issuedAt,
     expiresAt,
+    service: args.service,
   });
 
   const session: LeaseSession = {
@@ -547,6 +635,8 @@ export async function acquireCommand(
     consumer: consumer.publicKey(),
     token,
     callsLimit: args.calls,
+    pricePaid: chainState.pricePaid,
+    pricePerCall: chainState.pricePaid / args.calls,
     issuedAt,
     expiresAt,
     txHash: result.txHash,
@@ -600,8 +690,7 @@ export function mergeEnv(existing: string, entries: Record<string, string>): str
     const key = match[2] as string;
     if (key in entries && !emitted.has(key)) {
       emitted.add(key);
-      return `${exportPrefix}${key}=${entries[key]}`;
-      return `${key}=${quoteEnvValue(entries[key] as string)}`;
+      return `${exportPrefix}${key}=${quoteEnvValue(entries[key] as string)}`;
     }
     if (key in entries) return null; // drop duplicates
     return line;
@@ -661,9 +750,13 @@ export async function envCommand(
   }
 
   const entries = envEntriesFor(session);
+  // Tighten permissions on the read path too, in case the file already exists
+  // wider than 0600 before new secrets are merged into it.
+  await restrictEnvFile(args.file, chmodFile);
   const existing = await read(args.file).catch(() => '');
   const merged = mergeEnv(existing, entries);
   await write(args.file, merged);
+  await restrictEnvFile(args.file, chmodFile);
 
   const keys = Object.keys(entries);
   if (args.json) {

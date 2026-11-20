@@ -5,13 +5,21 @@ import { Keypair, StrKey } from '@stellar/stellar-sdk';
  *
  *   kls1.<base64url(payload JSON)>.<base64url(ed25519 signature)>
  *
- * The payload carries `(lease_id, consumer, iat, exp)` and is signed by the
- * consumer's ed25519 key (the Stellar account that created the lease on chain).
+ * The payload carries `(lease_id, consumer, iat, exp)`, plus an optional
+ * `service` claim naming the service the lease was bought for, and is signed
+ * by the consumer's ed25519 key (the Stellar account that created the lease on chain).
  * The signature covers the *transmitted* payload segment verbatim, so decoding
  * is canonical by construction: no JSON key-order or float round-tripping.
  *
  * A proxy only needs the token to verify the signature; the on-chain lease is
  * then checked separately over Soroban RPC to bind `consumer` to `lease_id`.
+ *
+ * Service binding and compatibility: `service` was added to the v1 format as
+ * an optional claim, so `v` stays `1`. Tokens minted before it existed have no
+ * `service` and still verify. When a verifier knows which service it gates it
+ * passes `expectedService`; a token that carries a different `service` is then
+ * rejected with `service_mismatch`, while a legacy token without the claim is
+ * accepted (the on-chain lease remains the authority on its service).
  */
 export const SESSION_TOKEN_PREFIX = 'kls1';
 export const SESSION_TOKEN_VERSION = 1;
@@ -27,6 +35,11 @@ export interface SessionTokenPayload {
   iat: number;
   /** Expiry, unix seconds. */
   exp: number;
+  /**
+   * Service id the lease was acquired for. Optional: absent on tokens minted
+   * before service binding, which remain valid v1 tokens.
+   */
+  service?: string;
 }
 
 export type TokenErrorCode =
@@ -36,6 +49,7 @@ export type TokenErrorCode =
   | 'bad_signature'
   | 'consumer_mismatch'
   | 'lease_mismatch'
+  | 'service_mismatch'
   | 'token_expired'
   | 'token_not_yet_valid';
 
@@ -72,6 +86,8 @@ export interface MintSessionTokenInput {
   issuedAt?: number;
   /** Absolute expiry in unix seconds. */
   expiresAt: number;
+  /** Service id the lease was acquired for; becomes the `service` claim. */
+  service?: string;
 }
 
 /**
@@ -92,6 +108,9 @@ export function mintSessionToken(input: MintSessionTokenInput): string {
   if (input.expiresAt <= issuedAt) {
     throw new TokenVerificationError('malformed_token', 'token expiry must be after issue time');
   }
+  if (input.service !== undefined && (typeof input.service !== 'string' || input.service.length === 0)) {
+    throw new TokenVerificationError('malformed_token', 'service claim must be a non-empty string');
+  }
 
   const payload: SessionTokenPayload = {
     v: SESSION_TOKEN_VERSION,
@@ -99,6 +118,9 @@ export function mintSessionToken(input: MintSessionTokenInput): string {
     consumer: keypair.publicKey(),
     iat: issuedAt,
     exp: input.expiresAt,
+    // Omitted entirely (not `undefined`) when unknown, so the payload of a
+    // token minted without a service is byte-for-byte the legacy shape.
+    ...(input.service !== undefined ? { service: input.service } : {}),
   };
 
   const encodedPayload = encodeSegment(JSON.stringify(payload));
@@ -157,6 +179,12 @@ export function parseSessionToken(token: string): DecodedSessionToken {
   ) {
     throw new TokenVerificationError('malformed_token', 'payload is missing required fields');
   }
+  if (
+    payload.service !== undefined &&
+    (typeof payload.service !== 'string' || payload.service.length === 0)
+  ) {
+    throw new TokenVerificationError('malformed_token', 'service claim must be a non-empty string');
+  }
   if (payload.v !== SESSION_TOKEN_VERSION) {
     throw new TokenVerificationError('unsupported_version', `unsupported token version ${payload.v}`);
   }
@@ -174,13 +202,19 @@ export interface VerifySessionTokenOptions {
   expectedLeaseId?: string;
   /** When set, the token must be signed by exactly this consumer account. */
   expectedConsumer?: string;
+  /**
+   * When set, a token that carries a `service` claim must name exactly this
+   * service (`service_mismatch` otherwise). Legacy tokens without the claim
+   * are still accepted.
+   */
+  expectedService?: string;
   /** Allowed future drift for `iat`, in seconds. Defaults to 60. */
   maxClockSkewSeconds?: number;
 }
 
 /**
  * Fully authenticates a bearer token: structure, version, ed25519 signature,
- * binding to the expected lease/consumer, and validity window.
+ * binding to the expected lease/consumer/service, and validity window.
  */
 export function verifySessionToken(
   token: string,
@@ -205,6 +239,13 @@ export function verifySessionToken(
   }
   if (options.expectedConsumer !== undefined && payload.consumer !== options.expectedConsumer) {
     throw new TokenVerificationError('consumer_mismatch', 'token consumer does not match the lease consumer');
+  }
+  if (
+    options.expectedService !== undefined &&
+    payload.service !== undefined &&
+    payload.service !== options.expectedService
+  ) {
+    throw new TokenVerificationError('service_mismatch', 'token is not scoped to the requested service');
   }
 
   const now = options.now ?? Math.floor(Date.now() / 1000);

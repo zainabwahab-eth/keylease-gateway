@@ -173,6 +173,10 @@ export interface SorobanClientOptions {
   server: SorobanRpc;
   contractId: string;
   networkPassphrase: string;
+  /** Transaction inclusion fee in stroops. Defaults to the SDK base fee. */
+  fee?: number;
+  /** Envelope timeout in seconds. Defaults to 60 seconds. */
+  timeout?: number;
   txPollAttempts?: number;
   txPollIntervalMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -300,13 +304,16 @@ export function encodeLeaseState(state: LeaseState): xdr.ScVal {
   ]);
 }
 
-/** Validates the decimal `u64` lease id used on chain and in bearer tokens. */
+/** Validates the canonical decimal `u64` lease id used on chain and in bearer tokens.
+ *  Requires the canonical form: 0, or [1-9] followed by optional digits.
+ *  Rejects leading zeros (e.g., 00, 007) to avoid lease id collisions in comparisons and logs.
+ */
 export function parseLeaseId(leaseId: string): bigint {
-  if (!/^[0-9]+$/.test(leaseId)) {
-    throw new SorobanError(`lease id "${leaseId}" must be a decimal u64`);
+  if (!/^(0|[1-9][0-9]*)$/.test(leaseId)) {
+    throw new SorobanError(`lease id "${leaseId}" must be in canonical decimal form (0 or [1-9][0-9]*)`);
   }
   const value = BigInt(leaseId);
-  if (value <= 0n || value > 0xffff_ffff_ffff_ffffn) {
+  if (value > 0xffff_ffff_ffff_ffffn) {
     throw new SorobanError(`lease id "${leaseId}" is out of the u64 range`);
   }
   return value;
@@ -412,14 +419,27 @@ export class SorobanClient {
   private readonly server: SorobanRpc;
   private readonly contractId: string;
   private readonly networkPassphrase: string;
+  private readonly fee: string;
+  private readonly timeout: number;
   private readonly txPollAttempts: number;
   private readonly txPollIntervalMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(options: SorobanClientOptions) {
+    if (options.fee !== undefined && (!Number.isSafeInteger(options.fee) || options.fee <= 0)) {
+      throw new SorobanError(`transaction fee must be a positive safe integer in stroops, got ${options.fee}`);
+    }
+    if (
+      options.timeout !== undefined &&
+      (!Number.isSafeInteger(options.timeout) || options.timeout <= 0)
+    ) {
+      throw new SorobanError(`transaction timeout must be a positive safe integer in seconds, got ${options.timeout}`);
+    }
     this.server = options.server;
     this.contractId = options.contractId;
     this.networkPassphrase = options.networkPassphrase;
+    this.fee = options.fee === undefined ? BASE_FEE : String(options.fee);
+    this.timeout = options.timeout ?? DEFAULT_TX_TIMEOUT_SECONDS;
     this.txPollAttempts = options.txPollAttempts ?? DEFAULT_TX_POLL_ATTEMPTS;
     this.txPollIntervalMs = options.txPollIntervalMs ?? DEFAULT_TX_POLL_INTERVAL_MS;
     this.sleep = options.sleep ?? defaultSleep;
@@ -433,6 +453,7 @@ export class SorobanClient {
   static fromEnv(
     env: ClientEnv = process.env,
     serverFactory: (url: string) => SorobanRpc = createRpcServer,
+    transactionOptions: Pick<SorobanClientOptions, 'fee' | 'timeout'> = {},
   ): SorobanClient {
     const networkName = env.KEYLEASE_NETWORK ?? 'testnet';
     const network = NETWORKS[networkName];
@@ -456,6 +477,7 @@ export class SorobanClient {
       server: serverFactory(rpcUrl),
       contractId,
       networkPassphrase: network.networkPassphrase,
+      ...transactionOptions,
     });
   }
 
@@ -585,7 +607,10 @@ export class SorobanClient {
   /** Runs a read-only contract method through `simulateTransaction`. */
   private async simulate(method: string, args: xdr.ScVal[]): Promise<xdr.ScVal> {
     const transaction = this.build(method, args, SIMULATION_SOURCE, '0');
-    const simulation = await this.server.simulateTransaction(transaction);
+    const simulation = await withRetry(
+      () => this.server.simulateTransaction(transaction),
+      this.sleep,
+    );
     if (rpc.Api.isSimulationError(simulation)) {
       const code = contractErrorCode(simulation.error);
       throw new ContractCallError(method, code, simulation.error);
@@ -609,7 +634,10 @@ export class SorobanClient {
     const prepared = await this.server.prepareTransaction(transaction);
     prepared.sign(params.signer);
 
-    const sent = await this.server.sendTransaction(prepared);
+    const sent = await withRetry(
+      () => this.server.sendTransaction(prepared),
+      this.sleep,
+    );
     if (sent.status === 'ERROR') {
       const detail = transactionResultName(sent.errorResult?.result);
       throw new SorobanError(`${params.method} was rejected by the RPC (${sent.hash}): ${detail}`);
@@ -635,11 +663,11 @@ export class SorobanClient {
     const operation = new Contract(this.contractId).call(method, ...args);
     const account = new Account(source, sequence);
     return new TransactionBuilder(account, {
-      fee: BASE_FEE,
+      fee: this.fee,
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(operation)
-      .setTimeout(DEFAULT_TX_TIMEOUT_SECONDS)
+      .setTimeout(this.timeout)
       .build();
   }
 

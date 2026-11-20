@@ -848,6 +848,68 @@ describe('proxy routing', () => {
   });
 });
 
+describe('resolveConfig KEYLEASE_UPSTREAM_TIMEOUT_MS', () => {
+  const baseEnv = { KEYLEASE_UPSTREAM_URL: 'https://api.example.com' };
+
+  it('defaults to 15000 ms', () => {
+    expect(resolveConfig(baseEnv).requestTimeoutMs).toBe(15_000);
+  });
+
+  it('parses a positive timeout', () => {
+    expect(
+      resolveConfig({ ...baseEnv, KEYLEASE_UPSTREAM_TIMEOUT_MS: '2500' }).requestTimeoutMs,
+    ).toBe(2_500);
+  });
+
+  it('accepts 0 to disable the timeout', () => {
+    expect(
+      resolveConfig({ ...baseEnv, KEYLEASE_UPSTREAM_TIMEOUT_MS: '0' }).requestTimeoutMs,
+    ).toBe(0);
+  });
+
+  it('rejects negative, fractional or non-numeric values', () => {
+    for (const bad of ['-1', '1.5', 'abc', '']) {
+      expect(() =>
+        resolveConfig({ ...baseEnv, KEYLEASE_UPSTREAM_TIMEOUT_MS: bad }),
+      ).toThrow(ProxyConfigError);
+    }
+  });
+
+  it('reports the timeout in the startup summary', () => {
+    const config = resolveConfig({ ...baseEnv, KEYLEASE_UPSTREAM_TIMEOUT_MS: '900' });
+    expect(describeConfig(config)).toMatchObject({ requestTimeoutMs: 900 });
+  });
+
+  it('maps an upstream abort to 504 using the configured timeout', async () => {
+    const { impl } = stubFetch(
+      (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          const abort = () =>
+            reject(Object.assign(new Error('aborted'), { name: 'TimeoutError' }));
+          if (signal?.aborted) abort();
+          else signal?.addEventListener('abort', abort, { once: true });
+        }),
+    );
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+      requestTimeoutMs: 10,
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${mintToken()}` },
+    });
+
+    expect(res.statusCode).toBe(504);
+    expect(res.json()).toMatchObject({ error: 'gateway_timeout' });
+    await app.close();
+  });
+});
+
 describe('resolveConfig KEYLEASE_MAX_BODY_BYTES', () => {
   const baseEnv = { KEYLEASE_UPSTREAM_URL: 'https://api.example.com' };
 

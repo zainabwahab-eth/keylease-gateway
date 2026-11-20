@@ -52,6 +52,8 @@ export interface ProxyOptions {
 }
 
 export const DEFAULT_MAX_IN_FLIGHT = 1024;
+/** Default per-request upstream timeout; `0` disables it. */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 
 const REQUEST_ID_HEADER = 'x-request-id';
 const VALID_REQUEST_ID = /^[A-Za-z0-9._:~+=/-]{1,128}$/;
@@ -141,7 +143,7 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
   const { verifier, upstream } = options;
   const fetchImpl: typeof fetch = options.fetchImpl ?? globalThis.fetch;
   const forwardAuthorization = options.forwardAuthorization === true;
-  const requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
+  const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const verificationRetryAfterSeconds = Math.max(
     1,
     Math.ceil(Math.min(verifier.cacheTtlMs, 30_000) / 1_000),
